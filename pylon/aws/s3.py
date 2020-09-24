@@ -140,8 +140,8 @@ class Bucket(BaseMixin):
 
         return getPath(self.bucket.name, key)
 
-    def get(self, key, encoding=None) -> typing.Tuple[_STR_OR_BYTES, dict]:
-        """Retrieves a file from S3, returns the content and metadata"""
+    def get(self, key, encoding=None) -> _STR_OR_BYTES:
+        """Retrieves a file from S3, returns the content"""
         logging.debug(f'Retrieving S3 object {key}')
 
         response = self.bucket.Object(key).get()
@@ -154,7 +154,7 @@ class Bucket(BaseMixin):
         if encoding is not None:
             content = content.decode(encoding)
 
-        return content, metadata
+        return content
 
     def getStreamingBody(self, key):
         return self.bucket.Object(key).get()['Body']
