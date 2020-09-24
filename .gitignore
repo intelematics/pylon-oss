@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+
+.DS_Store
+.vscode
+.idea
+
+*.egg-info
+
+.eggs
+.coverage
+.outputs
+
+.aws-sam/
+.terraform/
