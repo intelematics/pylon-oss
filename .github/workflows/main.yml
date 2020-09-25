@@ -1,0 +1,73 @@
+name: Pre-merge checks
+
+#Triggers the workflow on push or pull request events but only for the master branch
+on:
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  pre-merge-checks:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout repos we need
+      - name: Checkout this repo
+        uses: actions/checkout@v2
+        with:
+          path: self
+
+      # Checkout current master
+      - name: Checkout current repo master
+        uses: actions/checkout@v2
+        with:
+          ref: master
+          path: master
+
+      # Setup environment
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.8"
+
+      # Install Requirements
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pylint
+          if [ -f self/requirements.txt ]; then pip install -r self/requirements.txt; fi
+
+      # Install pylon
+      - name: Install pylon
+        run: |
+          cd self
+          python setup.py install
+
+      # Run checks
+      - name: Test with pytest
+        run: |
+          cd self/tests
+          AWS_DEFAULT_REGION='dummy-region' pytest
+
+      # Ensure Version has been ticked
+      - name: Check version tick
+        run: |
+          CURR_SEMVER_MAJOR=$(python -c "from master.pylon.__version__ import __version__; print(__version__.split('.')[0])")
+          CURR_SEMVER_MINOR=$(python -c "from master.pylon.__version__ import __version__; print(__version__.split('.')[1])")
+          CURR_SEMVER_PATCH=$(python -c "from master.pylon.__version__ import __version__; print(__version__.split('.')[2])")
+          NEW_SEMVER_MAJOR=$(python -c "from self.pylon.__version__ import __version__; print(__version__.split('.')[0])")
+          NEW_SEMVER_MINOR=$(python -c "from self.pylon.__version__ import __version__; print(__version__.split('.')[1])")
+          NEW_SEMVER_PATCH=$(python -c "from self.pylon.__version__ import __version__; print(__version__.split('.')[2])")
+          if [ $NEW_SEMVER_MAJOR -gt $CURR_SEMVER_MAJOR ]; then
+              exit 0
+          elif [ $NEW_SEMVER_MAJOR -lt $CURR_SEMVER_MAJOR ]; then
+              exit 1
+          elif [ $NEW_SEMVER_MINOR -gt $CURR_SEMVER_MINOR ]; then
+              exit 0
+          elif [ $NEW_SEMVER_MINOR -lt $CURR_SEMVER_MINOR ]; then
+              exit 1
+          elif [ $NEW_SEMVER_PATCH -gt $CURR_SEMVER_PATCH ]; then
+              exit 0
+          elif [ $NEW_SEMVER_PATCH -lt $CURR_SEMVER_PATCH ]; then
+              exit 1
+          else
+              exit 1
+          fi
