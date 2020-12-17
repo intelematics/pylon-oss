@@ -19,7 +19,7 @@ from .models.ingestion import IngestionStep
 from .models.data import DataAsset
 from .interfaces.messaging import MessageProducer, MessageConsumer, NoMessagesAvailable, MessageTooLarge, MessageStore
 from .interfaces.entrypoint import Entrypoint
-from .io import FolderMessageProducerConsumer
+from .io import FolderMessageProducerConsumer, TopicMessageConsumer, QueueMessageProducerConsumer
 from .utils import logging
 from .utils import timed, catchAllExceptionsToLog
 
@@ -119,7 +119,7 @@ class Component(Entrypoint):
         inp = self.config['PYLON_INPUT']
 
         if inp.startswith('sqs://'):
-            return aws.sqs.Queue(inp[6:])
+            return QueueMessageProducerConsumer(inp[6:])
         if inp.startswith('folder://'):
             return FolderMessageProducerConsumer(inp[9:])
 
@@ -129,9 +129,9 @@ class Component(Entrypoint):
         output = self.config['PYLON_OUTPUT']
 
         if output.startswith('sns://'):
-            return aws.sns.Topic(output[6:])
+            return TopicMessageConsumer(output[6:])
         if output.startswith('sqs://'):
-            return aws.sqs.Queue(output[6:])
+            return QueueMessageProducerConsumer(output[6:])
         if output.startswith('folder://'):
             return FolderMessageProducerConsumer(output[9:])
 
