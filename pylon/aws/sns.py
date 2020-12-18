@@ -1,42 +1,37 @@
-import boto3
-import typing
+"""Provides an interface for interacting with AWS SNS Topics."""
 import functools
 
+import boto3
+
 from ._bases import BaseMixin
-from ..interfaces.messaging import MessageConsumer, MessageTooLarge
-from ..models.messages import BaseMessage
-from ._common import encodeMessage
+from ._common import Message
 from ..utils import logging
 
 
+class MessageTooLarge(Exception):
+    """Raised when trying to send a message to an SNS topic but the message is too large."""
+
+
 @functools.lru_cache(maxsize=16)
-class Topic(BaseMixin, MessageConsumer):
+class Topic(BaseMixin):
+    """A class for publishing messages to an AWS SNS Topic."""
+    def __init__(self, topic_arn: str):
+        super().__init__(topic_arn)
+        self.topic = boto3.resource('sns').Topic(topic_arn)
 
-    def __init__(self, topicArn: str):
-        super().__init__(topicArn)
-        self.topic = boto3.resource('sns').Topic(topicArn)
+    def publish_message(self, message: Message) -> None:
+        """Publishes a message to an SNS Topic.
 
-    def sendMessage(self, message: BaseMessage) -> None:
-        """Posts a notification to SNS"""
-        encoded = self._encode(message)
+        Args:
+            message (Message): The message to publish to SNS.
 
-        logging.info(
-            'Sending {msg} of {size} bytes to {dest}'
-            .format(
-                msg=str(message),
-                size=message.getApproxSize(),
-                dest=str(self)
-            )
-        )
+        Raises:
+            MessageTooLarge: Raised when the message being published is too large to do so.
+        """
+        logging.debug('Publishing message to %s', self.name)
 
+        encoded_message = message._encode()  # pylint: disable=protected-access
         try:
-            self.topic.publish(**encoded)
+            self.topic.publish(**encoded_message)
         except boto3.client('sns').exceptions.InvalidParameterException as _ex:
-            raise MessageTooLarge(str(_ex))
-
-    def _encode(self, message: BaseMessage) -> dict:
-        genericEncoded = encodeMessage(message)
-        return {
-            'Message': genericEncoded['body'],
-            'MessageAttributes': genericEncoded['attributes']
-        }
+            raise MessageTooLarge(str(_ex)) from _ex

@@ -1,12 +1,63 @@
+from __future__ import annotations
+
+import dataclasses
+from typing import Dict
+
 from ..models.messages import BaseMessage, ObjectType, MessageAttribute
 from ..models.data import DataAsset
 from ..models.ingestion import IngestionStep
 from ..interfaces.serializing import JsonSerializable
-from . import s3
+from ..utils import logging
 
 TRUE_STRING  = 'true'
 FALSE_STRING = 'false'
 
+@dataclasses.dataclass
+class Message:
+    """Represents a message from an SQS Queue."""
+    body: str
+    attributes: Dict = dataclasses.field(default_factory=dict)
+
+    def _encode(self):
+        # Ensure body is a string
+        body = self.body
+        if not isinstance(str, body):
+            body = str(body)
+            logging.debug('Message body "%s" is not a string, casting to string.', body)
+
+        # Ensure attribute keys and values are strings
+        attributes = dict()
+        for key, value in self.attributes.items():
+            if not isinstance(key, str):
+                key = str(key)
+                logging.debug('Attribute key "%s" is not a string, casting to string.', key)
+            if not isinstance(value, str):
+                value = str(value)
+                logging.debug(
+                    'Attribute value "%s" with key "%s" is not a string, casting to string.', value,
+                    key
+                )
+
+            attributes[key] = {
+                'StringValue': str(value),
+                'DataType': 'String',
+            }
+
+        encoded = {
+            'MessageBody': body,
+            'MessageAttributes': attributes,
+        }
+        return encoded
+
+    @classmethod
+    def _decode(cls, encoded_message: Dict) -> Message:
+        body = encoded_message['MessageBody']
+        attributes = {
+            key: value['StringValue']
+            for key, value
+            in encoded_message['MessageAttributes'].items()
+        }
+        return cls(body=body, attributes=attributes)
 
 def encodeMessage(message: BaseMessage) -> dict:
     """
