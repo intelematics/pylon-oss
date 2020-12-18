@@ -1,10 +1,9 @@
 """AWS SNS as a Pylon output."""
 
-from typing import Iterable
-
 from ..aws import sns
 from ..interfaces.messaging import MessageConsumer
 from ..models.messages import BaseMessage
+from._common import encode_message
 
 class TopicMessageConsumer(MessageConsumer):
     """A message consumer which uses AWS SNS to send messages."""
@@ -13,7 +12,9 @@ class TopicMessageConsumer(MessageConsumer):
         self._topic = sns.Topic(topic_arn)
 
     def sendMessage(self, message: BaseMessage) -> None:
-        self._topic.sendMessage(message)
-
-    def sendMessages(self, messages: Iterable[BaseMessage]) -> None:
-        self._topic.sendMessages(messages)
+        encoded_message = encode_message(message)
+        sns_message = sns.Message(
+            body=encoded_message['body'],
+            attributes=encoded_message['attributes']
+        )
+        self._topic.publish_message(sns_message)
