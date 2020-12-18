@@ -1,156 +1,193 @@
-import boto3
-import typing
-import uuid
+"""Provides an interface for interacting with AWS SQS Queues."""
+from __future__ import annotations
+
 import contextlib
+import dataclasses
 import functools
+from typing import ContextManager, Dict, Iterable, Optional
+import uuid
+
+import boto3
 
 from ._bases import BaseMixin
-from ..interfaces.messaging import MessageProducer, MessageConsumer, NoMessagesAvailable
-from ..models.messages import BaseMessage, ObjectType, MessageAttribute
-from ..models.data import DataAsset
 from ..utils import chunked
-from ._common import encodeMessage, decodeMessage
 from ..utils import logging
 
-@functools.lru_cache(maxsize=16)
-class Queue(BaseMixin, MessageConsumer, MessageProducer):
+class NoMessagesAvailable(Exception):
+    """Raised when there are no messages to get from an SQS Queue."""
 
+@dataclasses.dataclass
+class Message:
+    """Represents a message from an SQS Queue."""
+    body: str
+    attributes: Dict = dataclasses.field(default_factory=dict)
+
+    def _encode(self):
+        # Ensure body is a string
+        body = self.body
+        if not isinstance(str, body):
+            body = str(body)
+            logging.debug('Message body "%s" is not a string, casting to string.', body)
+
+        # Ensure attribute keys and values are strings
+        attributes = dict()
+        for key, value in self.attributes.items():
+            if not isinstance(key, str):
+                key = str(key)
+                logging.debug('Attribute key "%s" is not a string, casting to string.', key)
+            if not isinstance(value, str):
+                value = str(value)
+                logging.debug(
+                    'Attribute value "%s" with key "%s" is not a string, casting to string.', value,
+                    key
+                )
+
+            attributes[key] = {
+                'StringValue': str(value),
+                'DataType': 'String',
+            }
+
+        encoded = {
+            'MessageBody': body,
+            'MessageAttributes': attributes,
+        }
+        return encoded
+
+    @classmethod
+    def _decode(cls, encoded_message: Dict) -> Message:
+        body = encoded_message['MessageBody']
+        attributes = {
+            key: value['StringValue']
+            for key, value
+            in encoded_message['MessageAttributes'].items()
+        }
+        return cls(body=body, attributes=attributes)
+
+
+@functools.lru_cache(maxsize=16)
+class Queue(BaseMixin):
+    """A class for sending and receiving messages from an AWS SQS Queue."""
     def __init__(self, queueName: str):
         super().__init__(queueName)
         self.resource = boto3.resource('sqs')
         self.client = boto3.client('sqs')
         self.queue = self.resource.get_queue_by_name(QueueName=queueName)
 
-    def sendMessage(self, message: BaseMessage) -> None:
-        """Posts a notification to SQS"""
-        encoded = self._encode(message)
+    def send_message(self, message: Message) -> None:
+        """Sends a message to an SQS queue.
 
-        logging.info(
-            'Sending {msg} of {size} bytes to {dest}'
-            .format(
-                msg=str(message),
-                size=message.getApproxSize(),
-                dest=str(self)
-            )
-        )
-        self.queue.send_message(**encoded)
+        Args:
+            message (Messages): The message to be sent.
+        """
+        # Send the message
+        logging.debug('Sending message to %s.', self.name)
+        self.queue.send_message(**message._encode())  # pylint: disable=protected-access
 
-    def sendMessages(self, messages: typing.Iterable[BaseMessage]) -> None:
-        """Override the basic `sendMessages` functionality and send messages in batches."""
-        for i, chunk in enumerate(chunked(messages, chunkSize=10)):
-            logging.info(f'Sending chunk {i} to {self}')
-            encoded = [self._encode(message) for message in chunk]
-            for message in encoded:
+    def send_messages(self, messages: Iterable[Message], chunk_size: Optional[int] = 10) -> None:
+        """Send messages to SQS in a batch.
+
+        Args:
+            messages (Iterable[Message]): The messages to be sent.
+            chunk_size (int, optional): The number of messages to send to SQS in one go.
+                Defaults to 10.
+        """
+        for i, chunk in enumerate(chunked(messages, chunkSize=chunk_size)):
+            logging.debug('Preparing to send chunk %s to %s', i, self.name)
+            # Encode each message in this chunk
+            entries = [message._encode() for message in chunk]  # pylint: disable=protected-access
+
+            # Update each message in this chunk with an ID to make it unique within this chunk.
+            for message in entries:
                 message['Id'] = str(uuid.uuid1())
 
-            logging.info(
-                'Sending {n} messages totalling {size} bytes to {dest}'
-                .format(
-                    n=len(encoded),
-                    size=sum([message.getApproxSize() for message in chunk]),
-                    dest=str(self)
-                )
-            )
-
-            self.queue.send_messages(
-                Entries=encoded
-            )
+            # Send this chunk to the queue.
+            logging.debug('Sending %s messages to %s from chunk %s', len(entries), self.name, i)
+            self.queue.send_messages(Entries=entries)
+            # TODO: Check for messages which failed to send
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sqs.html#SQS.Queue.send_messages
 
     @contextlib.contextmanager
-    def getMessage(self) -> typing.Generator[BaseMessage, None, None]:
+    def get_message(self) -> ContextManager[Message]:
+        """Gets a message from the SQS Queue. Deletes the messsage from the queue once the context
+            is successfully existed.
+
+        Raises:
+            NoMessagesAvailable: Raised when there is not message availabe in the queue to get.
+
+        Returns:
+            Message: The message retrieved from the queue.
         """
-        Fetches a message from the SQS Queue.
-
-        Example usage:
-
-            queue = SQSQueue('my_awesome_queue')
-            try:
-                with queue.getMessage() as message:
-                    doSomething(message)
-            except NoMessagesAvailable:
-                pass
-
-        """
-        logging.debug(f'Receiving SQS message')
-
+        logging.debug('Receiving SQS message from %s', self.name)
+        # Retrieve the message
         messages = self.queue.receive_messages(
             MessageAttributeNames=['*'],
             MaxNumberOfMessages=1
         )
 
+        # If there were no messages to retrieve, raise an exception
         if len(messages) == 0:
-            logging.info(f'No messages available from {self}')
+            logging.info('No messages available from %s', self.name)
             raise NoMessagesAvailable
 
-        rawMessage = messages[0]
-        message = self._decode(rawMessage)
-        logging.info(f'Received {message} from {self}')
+        # Decode and yield the message received
+        raw_message = messages[0]
+        logging.debug('Received message with id "%s" from %s', raw_message.message_id, self.name)
+        message = Message._decode(raw_message)  # pylint: disable=protected-access
         yield message
 
-        logging.info(f'Deleting {message} from {self}')
-        rawMessage.delete()
+        # Delete the message once the context has been exited successfully
+        logging.debug('Deleting message with id "%s" from %s', raw_message.message_id, self.name)
+        raw_message.delete()
 
-    @contextlib.contextmanager
-    def getMessages(self, maxMessages) -> typing.Generator[typing.Iterator, None, None]:
+    def get_messages(
+            self, max_messages: Optional[int] = 10, batch_size: Optional[int] = 10
+    ) -> Iterable[Message]:
+        """Gets up to the number of messages specified from the queue.
+
+        Messages are returned as a generator and each message is deleted from the queue when the
+            next message in the generator is requested.
+
+        Args:
+            max_messages (Optional[int], optional): The maximum number of messages to return.
+                Defaults to 10.
+            batch_size (Optional[int], optional): The number of messages to ask SQS for in any one
+                request. Defaults to 10.
+
+        Returns:
+            Iterable[Message]: A generator of messages.
         """
-        Fetches a message from the SQS Queue.
+        logging.debug(
+            'Receiving up to %d messages from %s in batches of %d', max_messages, self.name,
+            batch_size
+        )
 
-        Example usage:
-
-            queue = SQSQueue('my_awesome_queue')
-            try:
-                with queue.getMessages(10) as messages:
-                    doSomething(messages)
-            except NoMessagesAvailable:
-                pass
-
-        """
-        logging.debug(f'Receiving SQS messages')
-
-        rawMessages = []
-        remaining = maxMessages
+        remaining = max_messages
+        batch_n = 0
         while remaining > 0:
-            batchSize = min(10, remaining)
+            logging.debug('Fetching batch number %d from %s', batch_n, self.name)
             fetched = self.queue.receive_messages(
                 MessageAttributeNames=['*'],
-                MaxNumberOfMessages=batchSize
+                MaxNumberOfMessages=min(batch_size, remaining)
             )
-            if len(fetched) > 0:
-                rawMessages = rawMessages + fetched
-                remaining -= len(fetched)
-            else:
-                break
 
-        if len(rawMessages) == 0:
-            logging.info(f'No messages available from {self}')
-            raise NoMessagesAvailable
+            for raw_message in fetched:
+                # Perhaps this isn't the best strategy. If the caller stops iterating, the last
+                # message yielded won't be deleted.
+                logging.debug('Yielding message with id "%s"', raw_message.message_id)
+                message = Message._decode(raw_message)  # pylint: disable=protected-access
+                yield message
+                raw_message.delete()
+                logging.debug(
+                    'Deleting message with id "%s" from %s', raw_message.message_id, self.name
+                )
 
-        messages = [self._decode(m) for m in rawMessages]
-        logging.info(f'Received {len(messages)} messages from {self}')
-
-        yield messages
-
-        logging.info(f'Deleting {len(messages)} messages from {self}')
-        for rawMessage in rawMessages:
-            rawMessage.delete()
+            remaining -= len(fetched)
+            batch_n += 1
 
     def __len__(self):
         attributes = self.client.get_queue_attributes(
             QueueUrl=self.queue.url,
             AttributeNames=['ApproximateNumberOfMessages']
         )
-        numMessages = int(attributes['Attributes']['ApproximateNumberOfMessages'])
-        return numMessages
-
-    def _encode(self, message: BaseMessage) -> dict:
-        genericEncoded = encodeMessage(message)
-        return {
-            'MessageBody': genericEncoded['body'],
-            'MessageAttributes': genericEncoded['attributes']
-        }
-
-    def _decode(self, rawMessage) -> BaseMessage:
-        return decodeMessage(
-            body=rawMessage.body,
-            attributes=rawMessage.message_attributes
-        )
+        num_messages = int(attributes['Attributes']['ApproximateNumberOfMessages'])
+        return num_messages
