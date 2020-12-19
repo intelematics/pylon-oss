@@ -7,127 +7,158 @@ Defines components.
 - NullComponent: does not receive or publish anything
 """
 
-import typing
-import contextlib
-import copy
-import itertools
-import functools
+import datetime
+from typing import Any, Callable, Dict, Iterable
 
 from . import aws
-from .models.messages import BaseMessage, ObjectType, IngestionMessage
-from .models.ingestion import IngestionStep
+
 from .models.data import DataAsset
-from .interfaces.messaging import MessageProducer, MessageConsumer, NoMessagesAvailable, MessageTooLarge, MessageStore
+from .models.ingestion import IngestionStep
+from .models.messages import BaseMessage, ObjectType
+from .interfaces.messaging import MessageProducer, MessageConsumer, MessageTooLarge, MessageStore
 from .interfaces.entrypoint import Entrypoint
 from .io import FolderMessageProducerConsumer, TopicMessageConsumer, QueueMessageProducerConsumer
 from .utils import logging
-from .utils import timed, catchAllExceptionsToLog
+from .utils import catchAllExceptionsToLog
 
 
 class Component(Entrypoint):
-    @timed('total')
-    @catchAllExceptionsToLog
-    def runOnce(self):
-        """
-        Process a single message
-        """
+    def __init__(self, core_function: Callable):
+        self.core_function: Callable = core_function
+
+        self.input: MessageProducer = self._get_input()  # TODO: Move this function to io
+        self.output: MessageConsumer = self._get_output()  # TODO: Move this function to io
+
+        self.message_store: MessageStore = self._get_message_store()  # TODO: Move this function to io
+
+    @catchAllExceptionsToLog  # TODO: Find a better way to do this, maybe just change decorator
+    def run_once(self) -> None:
         logging.info('heartbeat: run_once')
-        if self._hasInput:
-            try:
-                with self.inputMessageProducer.getMessage() as message:
-                    self._runOnce(message)
-            except NoMessagesAvailable:
-                pass
-        else:
-            self._runOnce(None)
+        messages = self._get_messages
+        for message in messages:
+            context: Dict[str, Any] = dict()
+            self.setup(context)
+            message = self.prepare_in_message(message, context)
 
-    def lambda_handler(self, event, context):
-        logging.info('heartbeat: lambda_handler')
-        if self._hasInput:
-            self.inputMessageProducer = aws.lambda_.PseudoQueue(event)
+            context['start_datetime'] = _utcnow()
+            out_messages = self.core_function(message, self.config)
+            context['end_datetime'] = _utcnow()
 
-            while len(self.inputMessageProducer) > 0:
-                self.runOnce(PYLON_ALLOW_EXCEPTIONS=True)
-        else:
-            self.runOnce(PYLON_ALLOW_EXCEPTIONS=True)
+            if self.has_output:
+                out_messages = self.prepare_out_messages(out_messages, context)
+                self._send_messages(out_messages)
+            elif out_messages is not None:
+                logging.warning('Component produced an output, but no output has been specified.')
+            self.teardown(context)
 
-    def _runOnce(self, message: BaseMessage):
-        ingestionStep = self._getIngestionStep(message)
+    def setup(self, context: Dict[str, Any]) -> None:
+        # Create ingestion step
+        ingestion_step = IngestionStep()
+        ingestion_step.populate(self.config)
 
+        # Logging
         logging.updateLogger(
-            ingestionId=ingestionStep.ingestionId, logFormat=self.config['PYLON_LOG_FORMAT'],
+            ingestionId=ingestion_step.ingestionId, logFormat=self.config['PYLON_LOG_FORMAT'],
             logLevel=self.config['PYLON_LOG_LEVEL']
         )
+        logging.info('heartbeat: start_core_process')
+
+        context['ingestion_step'] = ingestion_step
+
+    def prepare_in_message(self, message: BaseMessage, context: Dict[str, Any]) -> BaseMessage:
+        ingestion_step = context['ingestion_step']
+        ingestion_step.parentIngestionId = message.parentIngestionId
+
         logging.info({
-            'message': 'heartbeat: core_process',
-            'parentIngestionId': str(ingestionStep.parentIngestionId)
+            'message': 'Preparing message.',
+            'parentIngestionId': str(ingestion_step.parentIngestionId)
         })
 
-        results = self._processInput(message=message)
-        if self._hasOutput:
-            if results is not None:
-                self._processOutput(results, ingestionStep)
-            else:
-                logging.warning(f'Component did not produce any output')
+        # Retrieve message if it is checked in to a message store
+        if message is not None and message.isCheckedIn():
+            message = _retrieveMessageBody(message)
 
-        # add duration time to ingestionStep
-        ingestionStep.updateMetadata({'durationSeconds': self.coreFunction.durationSeconds})
-        logging.info(f'INGESTION_STEP: {ingestionStep.toJSON()}')
+        return message
+
+    def prepare_out_messages(
+            self, messages: Iterable[BaseMessage], context: Dict[str, Any]
+    ) -> Iterable[BaseMessage]:
+        # If a message was received instead of an iterable of messages, make an iterable of messages
+        if not isinstance(messages, Iterable):  # pylint: disable=isinstance-second-argument-not-valid-type
+            messages = [messages]
+
+        ingestion_step = context['ingestion_step']
+
+        n_messages = 0
+        for message in messages:
+            # Remove message which are `None`
+            if message is None:
+                continue
+
+            n_messages += 1
+
+            # set ingestionId and some relevant information from it to all messages
+            message.ingestionId = ingestion_step.ingestionId
+            message.artifactName = ingestion_step.artifactName
+            message.artifactVersion = ingestion_step.artifactVersion
+
+            # double happiness if data asset 囍
+            if message.objectType == ObjectType.DATA_ASSET:
+                message.body.ingestionId = ingestion_step.ingestionId
+                for row in message.body.data:
+                    row['ingestion_id'] = ingestion_step.ingestionId
+
+            # Store message in message store if appropriate
+            message = _storeMessageBody(message, self.config)
+
+            yield message
+
+        logging.info({'n_out_messages': n_messages})
+        if not n_messages:
+            logging.warning('Component produced no output messages.')
+
+    def teardown(self, context: Dict[str, Any]) -> None:
+        ingestion_step = context['ingestion_step']
+
+        duration_seconds = (context['start_datetime'] - context['end_datetime']).total_seconds()
+        ingestion_step.updateMetadata({'duration_seconds': duration_seconds})
+
+        logging.info({'INGESTION_STEP': ingestion_step.to_json()})
 
         logging.tearDownLogging(
             logFormat=self.config['PYLON_LOG_FORMAT'], logLevel=self.config['PYLON_LOG_LEVEL']
         )
 
-    def _processInput(self, message):
-        if message is not None and message.isCheckedIn():
-            message = _retrieveMessageBody(message)
+    def _get_messages(self) -> Iterable[BaseMessage]:
+        return self.input.get_messages(max_messages=self.config['PYLON_MAX_MESSAGES'])  # TODO: Better name for config variable
 
-        results = self.coreFunction(message, self.config)
-        return results
+    def _send_messages(self, messages: Iterable[BaseMessage]):
+        try:
+            self.output.sendMessages(messages)
+        except MessageTooLarge as _ex:
+            raise MessageTooLarge(
+                'Failed to send message because it is too large. Try using '
+                'PYLON_STORE_DESTINATION and PYLON_STORE_MIN_MESSAGE_BYTES to store the body '
+                'of large messages before sending them.'
+            ) from _ex
 
-    def _processOutput(self, results, ingestionStep):
-        if not isinstance(results, typing.Iterable):
-            results = [results]
+    def _get_input(self) -> MessageProducer:
+        inp = self.config.get('PYLON_INPUT')
 
-        results = (
-            _storeMessageBody(_populateMessageAttributes(msg, ingestionStep), self.config)
-            for msg in results
-            if msg is not None
-        )
-
-        self._sendMessages(results)
-
-    def _getIngestionStep(self, message: BaseMessage):
-        ingestionStep = IngestionStep()
-        parentIngestionId = message.ingestionId if message is not None else None
-        ingestionStep.populate(config=self.config, parentIngestionId=parentIngestionId)
-        return ingestionStep
-
-    def _sendMessages(self, messages: typing.Iterable[BaseMessage]):
-        if messages is not None:
-            messages = (message for message in messages if message is not None)
-            try:
-                self.outputMessageConsumer.sendMessages(messages)
-            except MessageTooLarge:
-                raise MessageTooLarge(
-                    'Failed to send message because it is too large. Try using '
-                    'PYLON_STORE_DESTINATION and PYLON_STORE_MIN_MESSAGE_BYTES to store the body'
-                    'of large messages before sending them.'
-                )
-
-    def _getInputFromConfig(self) -> MessageProducer:
-        inp = self.config['PYLON_INPUT']
-
+        if inp is None:
+            return None
         if inp.startswith('sqs://'):
             return QueueMessageProducerConsumer(inp[6:])
         if inp.startswith('folder://'):
             return FolderMessageProducerConsumer(inp[9:])
 
-        raise NotImplementedError(f"Unsupported input {self.config['PYLON_INPUT']}")
+        raise NotImplementedError(f'Unsupported input "{inp}"')
 
-    def _getOutputFromConfig(self) -> MessageConsumer:
+    def _get_output(self) -> MessageConsumer:
         output = self.config['PYLON_OUTPUT']
 
+        if output is None:
+            return None
         if output.startswith('sns://'):
             return TopicMessageConsumer(output[6:])
         if output.startswith('sqs://'):
@@ -135,161 +166,18 @@ class Component(Entrypoint):
         if output.startswith('folder://'):
             return FolderMessageProducerConsumer(output[9:])
 
-        raise NotImplementedError(f"Unsupported output {self.config['PYLON_OUTPUT']}")
+        raise NotImplementedError(f'Unsupported output "{output}"')
+
+    def _get_message_store(self) -> MessageStore:
+        return _getStoreFromConfig(self.config)
 
     @property
-    def _hasInput(self):
-        try:
-            return self.inputMessageProducer is not None
-        except AttributeError:
-            return False
+    def _has_input(self):
+        return self.input is not None
 
     @property
-    def _hasOutput(self):
-        try:
-            return self.outputMessageConsumer is not None
-        except AttributeError:
-            return False
-
-
-class PipelineComponent(Component):
-    """
-    A component that receives an input message, and generates one or more output
-    messages. This is typically a step in a data pipeline, such as transforming
-    data.
-
-    Use this class to decorate a function to provide plumbing to input queues,
-    output topics and ingestion boilerplate.
-
-    Usage:
-
-    ```
-    @PipelineComponent
-    def myWorkflow(
-       message: BaseMessage,
-       config: dict
-    ) -> typing.Union[BaseMessage, typing.Iterable[BaseMessage]]:
-       # do something with the message
-       # add something interesting to the ingestion step
-       # return some results
-       pass
-
-    if __name__ == '__main__':
-        myWorkflow.runForever()
-    ```
-    """
-
-    def makeAdapters(self):
-        self.inputMessageProducer = self._getInputFromConfig()
-        self.outputMessageConsumer = self._getOutputFromConfig()
-
-
-class SourceComponent(Component):
-    """
-    A component that generates output messages, but does not consume any input
-    messages. This is the "source" of a pipeline, typically a fetcher that
-    downloads data from a supplier triggered by an external scheduler. Often used in combination
-    with the config variable `PYLON_LOOP_SLEEP_SECONDS` which defines the number of seconds between
-    calls to the function decorated by `@SourceComponent`.
-
-    Use this class to decorate a function to provide plumbing to output topics
-    and ingestion boilerplate.
-
-    Usage:
-
-    ```
-    @SourceComponent
-    def myWorkflow(
-        message: BaseMessage
-        config: dict
-    ) -> typing.Union[BaseMessage, typing.Iterable[BaseMessage]]:
-        # do something with the message
-        # add something interesting to the ingestion step
-        # return some results
-        pass
-
-    if __name__ == '__main__':
-        myWorkflow.runOnce()
-    ```
-    """
-    def makeAdapters(self):
-        self.outputMessageConsumer = self._getOutputFromConfig()
-
-
-class SinkComponent(Component):
-    """
-    A component that receives an input message, but does not produce any output
-    messages.
-
-    Use this class to decorate a function to provide plumbing to input queues.
-
-    Usage:
-
-    ```
-    @SinkComponent
-    def myWorkflow(
-       message: BaseMessage,
-       config: dict
-    ) -> None:
-       # do something with the message
-       # add something interesting to the ingestion step
-       pass
-
-    if __name__ == '__main__':
-        myWorkflow.runForever()
-    ```
-    """
-
-    def makeAdapters(self):
-        self.inputMessageProducer = self._getInputFromConfig()
-
-
-class NullComponent(Component):
-    """
-    A component that generates no output messages, and does not consume any input
-    messages. This is a weird component useful for running things on a timer in ECS. Often used in
-    combination with the config variable `PYLON_LOOP_SLEEP_SECONDS` which defines the number of
-    seconds between calls to the function decorated by `@SourceComponent`.
-
-    Usage:
-
-    ```
-    @NullComponent
-    def myWorkflow(
-       message: BaseMessage,
-       config: dict,
-    ) -> None:
-       del message
-       # do something interesting
-       pass
-
-    if __name__ == '__main__':
-        myWorkflow.runForever()
-    ```
-    """
-    pass
-
-
-def _populateMessageAttributes(
-    message: BaseMessage,
-    ingestionStep: IngestionStep
-):
-    message = copy.deepcopy(message)
-
-    # set ingestionId and some relevant information from it to all messages
-    message.ingestionId = ingestionStep.ingestionId
-    message.artifactName = ingestionStep.artifactName
-    message.artifactVersion = ingestionStep.artifactVersion
-
-    # double happiness if data asset
-    # 囍
-    if message.objectType == ObjectType.DATA_ASSET:
-        message.body.ingestionId = ingestionStep.ingestionId
-        for row in message.body.data:
-            row['ingestion_id'] = ingestionStep.ingestionId
-
-
-    return message
+    def has_output(self):
+        return self.output is not None
 
 
 def _getStoreFromConfig(config: dict) -> MessageStore:
@@ -340,3 +228,7 @@ def _retrieveMessageBody(message: BaseMessage) -> BaseMessage:
         message.body = IngestionStep.fromJSON(message.body)
 
     return message
+
+
+def _utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
