@@ -37,15 +37,15 @@ class Queue(BaseMixin):
         logging.debug('Sending message to %s.', self.name)
         self.queue.send_message(**message._encode())  # pylint: disable=protected-access
 
-    def send_messages(self, messages: Iterable[Message], chunk_size: Optional[int] = 10) -> None:
+    def send_messages(self, messages: Iterable[Message], batch_size: Optional[int] = 10) -> None:
         """Send messages to SQS in a batch.
 
         Args:
             messages (Iterable[Message]): The messages to be sent.
-            chunk_size (int, optional): The number of messages to send to SQS in one go.
+            batch_size (int, optional): The number of messages to send to SQS in one go.
                 Defaults to 10.
         """
-        for i, chunk in enumerate(chunked(messages, chunkSize=chunk_size)):
+        for i, chunk in enumerate(chunked(messages, chunkSize=batch_size)):
             logging.debug('Preparing to send chunk %s to %s', i, self.name)
             # Encode each message in this chunk
             entries = [message._encode() for message in chunk]  # pylint: disable=protected-access

@@ -49,6 +49,7 @@ class Component(Entrypoint):
                 self._send_messages(out_messages)
             elif out_messages is not None:
                 logging.warning('Component produced an output, but no output has been specified.')
+
             self.teardown(context)
 
     def setup(self, context: Dict[str, Any]) -> None:
@@ -134,7 +135,7 @@ class Component(Entrypoint):
 
     def _send_messages(self, messages: Iterable[BaseMessage]):
         try:
-            self.output.sendMessages(messages)
+            self.output.send_messages(messages)
         except MessageTooLarge as _ex:
             raise MessageTooLarge(
                 'Failed to send message because it is too large. Try using '

@@ -1,39 +1,34 @@
-import contextlib
 import json
 import os
-import typing
+from typing import Iterable
 import uuid
 
-from ..interfaces.messaging import MessageConsumer, MessageProducer, NoMessagesAvailable
+from ..interfaces.messaging import MessageConsumer, MessageProducer
 from .. import interfaces
 from .. import models
 from .. import utils
 
-class FolderMessageProducerConsumer(MessageProducer, MessageConsumer):
+
+class Folder(MessageProducer, MessageConsumer):
     def __init__(self, path: str):
         self.path = path
         os.makedirs(path, exist_ok=True)
 
-    @contextlib.contextmanager
-    def getMessage(self) -> models.messages.BaseMessage:
-        filepaths = _listFilepaths(self.path)
+    def get_messages(self) -> Iterable[models.messages.BaseMessage]:
+        filepaths = _list_filepaths(self.path)
 
-        try:
-            filepath = next(filepaths)
-        except StopIteration:
-            raise NoMessagesAvailable(f'No messages available under path {self.path}')
+        for filepath in filepaths:
+            raw_message = _read_file(filepath)
+            message = _decode(raw_message)
+            yield message
+            os.remove(filepath)
 
-        raw_message = _readFile(filepath)
-
-        message = _decode(raw_message)
-        yield message
-        os.remove(filepath)
-
-    def sendMessage(self, message: models.messages.BaseMessage):
-        raw_message = _encode(message)
-        filename = f'{uuid.uuid4()}.json'
-        filepath = os.path.join(self.path, filename)
-        _writeFile(raw_message, filepath)
+    def send_messages(self, messages: Iterable[models.messages.BaseMessage]):
+        for message in messages:
+            raw_message = _encode(message)
+            filename = f'{uuid.uuid4()}.json'
+            filepath = os.path.join(self.path, filename)
+            _write_file(raw_message, filepath)
 
 
 def _decode(raw_message: str) -> models.messages.BaseMessage:
@@ -45,7 +40,7 @@ def _decode(raw_message: str) -> models.messages.BaseMessage:
     if message.objectType in (
             models.messages.ObjectType.INGESTION_STEP, models.messages.ObjectType.DATA_ASSET
     ):
-        message.body = interfaces.serializing.JsonSerializable.fromJSON(message.body)
+        message.body = interfaces.serializing.JsonSerializable.from_json(message.body)
 
     return message
 
@@ -63,7 +58,7 @@ def _encode(message: models.messages.BaseMessage) -> str:
     return raw_message
 
 
-def _listFilepaths(path: str) -> typing.Iterable[str]:
+def _list_filepaths(path: str) -> Iterable[str]:
     return (
         filepath
         for filename in os.listdir(path)
@@ -72,12 +67,12 @@ def _listFilepaths(path: str) -> typing.Iterable[str]:
     )
 
 
-def _writeFile(inp: str, filepath: str):
+def _write_file(inp: str, filepath: str):
     with open(filepath, 'w') as _fd:
         _fd.write(inp)
 
 
-def _readFile(filepath: str) -> bytes:
+def _read_file(filepath: str) -> bytes:
     with open(filepath, 'r') as _fd:
         out = _fd.read()
     return out
